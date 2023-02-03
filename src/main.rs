@@ -1,89 +1,117 @@
 use zfuzz::{
-    emulator::Emulator,
-    hooks::{insert_debug_hooks, insert_syscall_hook, insert_malloc_hook, insert_free_hook},
-    config::{handle_cli, Cli},
-    error_exit, load_elf_segments, VMMAP_ALLOCATION_SIZE, FIRSTALLOCATION, DEBUG, dbg_print,
+    Statistics, AllShared, Input, worker, TargetShared,
+    arg_setup::{handle_cli, Cli},
+    targets::targets::{HarnessInit, TARGET_INIT_FUNCTIONS, TARGETS},
+    execution_state::take_snapshot,
+    pretty_printing::print_stats,
 };
-use byteorder::{LittleEndian, WriteBytesExt};
-use unicorn_engine::{
-    Unicorn,
-    RegisterRISCV,
-    unicorn_const::{Permission, uc_error, Arch, Mode},
-};
+
+use unicorn_engine::unicorn_const::uc_error;
+use rustc_hash::FxHashMap;
+use console::Term;
 use clap::Parser;
 
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub fn emulate(_emu: &Rc<RefCell<Emulator>>, uc: &mut Unicorn<'_, ()>) -> Result<(),uc_error> {
-    let start_addr = uc.pc_read()?;
-    uc.emu_start(start_addr, 0, 0, 0)?;
-    Ok(())
+/// Setup and spawn fuzzer-threads for target with given `target_id`
+fn start_target(tx: &Sender<Statistics>, all_shared: Arc<AllShared>, harness_init: HarnessInit) {
+
+    // Set up a temporary exec_env/unicorn engine to create the initial memory/file/context snapshot
+    let snapshot = {
+        let (exec_env, unicorn) = TARGET_INIT_FUNCTIONS[harness_init.target_id]()
+                                        .expect("Failed to initialize one of the fuzz-targets");
+        take_snapshot(&exec_env, &unicorn)
+            .expect(&format!("Failed to snapshot target: {}", harness_init.target_id))
+    };
+    
+    let target_shared: Arc<TargetShared> = Arc::new(TargetShared::default());
+
+    // Wrap thread-shared objects for this target in `Arc` so they can be safely shared
+    let snapshot = Arc::new(snapshot);
+
+    // Spawn worker threads to do the actual fuzzing for the `target_id` target 
+    for _ in 0..harness_init.num_threads {
+        let all_shared    = all_shared.clone();
+        let target_shared = target_shared.clone();
+        let snapshot      = snapshot.clone();
+        let tx            = tx.clone();
+
+        thread::spawn(move || worker(&harness_init, snapshot, all_shared, target_shared, tx));
+    }
 }
 
 fn main() -> Result<(), uc_error> {
-    // Create emulator that will hold system context such as open files, dirty pages, etc
-    let emu: Rc<RefCell<Emulator>> = Rc::new(RefCell::new(Emulator::new()));
-
-    // Create unicorn cpu emulator
-    let mut unicorn = unicorn_engine::Unicorn::new(Arch::RISCV, Mode::RISCV64)?;
-
-    
     // Parse commandline-args and set config variables based on them
-    let mut args = Cli::parse();
+    let mut args: Cli = Cli::parse();
     handle_cli(&mut args);
 
-    load_elf_segments(&mut unicorn).unwrap_or_else(|err| {
-        let error_string = format!("{:#?}", err);
-        error_exit(&format!("Unrecoverable error while loading elf segments: {}", error_string));
-    });
+    // Statistics structure. This is kept local to the main thread and updated via message passing 
+    // from the worker threads to reduce shared state
+    let mut stats: FxHashMap<usize, Statistics> = FxHashMap::default();
+    TARGETS.iter().for_each(|t| { stats.insert(t.target_id, Statistics::new(t.target_id)); });
 
-    // Allocate memory map for emulator. This backing will be used to allocate the initial stack 
-    // and handle later heap allocations during program execution
-    unicorn.mem_map(FIRSTALLOCATION as u64, VMMAP_ALLOCATION_SIZE, Permission::NONE).unwrap();
+    // Messaging objects used to transfer statistics between worker threads and main thread
+    let (tx, rx): (Sender<Statistics>, Receiver<Statistics>) = mpsc::channel();
 
-    // Allocate stack and populate argc, argv & envp
+    // This structure is shared between all threads and targets. It is initialized with the initial 
+    // input files and then keeps track of new inputs and some input-related statistics
+    let all_shared: AllShared = AllShared::new();
     {
-        let stack = emu.borrow_mut()
-            .allocate(&mut unicorn, 1024 * 1024, Permission::READ | Permission::WRITE)
-            .expect("Error allocating stack");
-        unicorn.reg_write(RegisterRISCV::SP, (stack + (1024 * 1024)) as u64)?;
+        let mut corpus_tmp = all_shared.inputs.write();
+        for filename in std::fs::read_dir(args.input_dir).unwrap() {
+            let filename = filename.unwrap().path();
+            let data = std::fs::read(filename).expect("Failed to read input file");
 
-        let argv: Vec<usize> = Vec::new();
-
-        // Macro to push 64-bit integers onto the stack
-        macro_rules! push {
-            ($expr:expr) => {
-                let sp = unicorn.reg_read(RegisterRISCV::SP)? - 8;
-                let mut wtr = vec![];
-                wtr.write_u64::<LittleEndian>($expr as u64).unwrap();
-                unicorn.mem_write(sp, &wtr)?;
-                unicorn.reg_write(RegisterRISCV::SP, sp)?;
-            }
+            // Add the input to the corpus
+            corpus_tmp.push(Input::new(data));
         }
-
-        // Setup argc, argv & envp
-        push!(0u64);            // Auxp
-        push!(0u64);            // Envp
-        push!(0u64);            // Null-terminate Argv
-        for arg in argv.iter().rev() {
-            push!(*arg);
-        }
-        push!(argv.len());      // Argc
+        if corpus_tmp.is_empty() { panic!("Please supply at least 1 initial seed"); }
     }
 
-    insert_syscall_hook(&emu, &mut unicorn)?;
+    // Wrap data in an `Arc` to make it thread-safe
+    let all_shared = Arc::new(all_shared);
 
-    insert_malloc_hook(&emu, &mut unicorn, 0x11088)?;
-    insert_free_hook(&emu, &mut unicorn, 0x12ab0)?;
-
-    if DEBUG {
-        insert_debug_hooks(&emu, &mut unicorn)?;
+    // Starts up all registered targets
+    {
+        TARGETS.iter().for_each(|t| start_target(&tx, all_shared.clone(), *t));
     }
 
-    emulate(&emu, &mut unicorn)?;
+    // Continuous statistic tracking via message passing in main thread
+    let start = Instant::now();
+    let mut last_time = Instant::now();
+    let mut last_cov_event: f64 = 0.0;
+    let term = Term::buffered_stdout();
+    term.clear_screen().unwrap();
 
-    dbg_print("Reached end of main");
+    // Sleep for short duration on startup before printing statistics, otherwise elapsed time might
+    // be 0, leading to a div-by-0 crash while printing statistics
+    thread::sleep(Duration::from_millis(1000));
 
+    for received in rx {
+        let elapsed_time = start.elapsed().as_secs_f64();
+
+        // Check if we got new coverage
+        if received.coverage != 0 {
+            last_cov_event = elapsed_time;
+        }
+
+        let id = received.target_id;
+
+        stats.get_mut(&id).unwrap().total_cases   += received.total_cases;
+        stats.get_mut(&id).unwrap().crashes       += received.crashes;
+        stats.get_mut(&id).unwrap().ucrashes      += received.ucrashes;
+        stats.get_mut(&id).unwrap().coverage      += received.coverage;
+        stats.get_mut(&id).unwrap().invalid_insns += received.invalid_insns;
+        stats.get_mut(&id).unwrap().num_inputs     = received.num_inputs;
+
+        // Print out updated statistics every second
+        if last_time.elapsed() >= Duration::from_millis(500) {
+            print_stats(&term, &stats, elapsed_time, last_cov_event);
+            last_time = Instant::now();
+        }
+    }
     Ok(())
 }
