@@ -86,6 +86,7 @@ Grammatron was unfortunately a little bit harder to set up, so including it in Z
 * Grammatron-generational:   50.8891 MiB/s,   802,460.4788 iters/s 
 * Resmack-generational:         21.3895 MiB/s,   521,365.4300 iters/s 
 * Dharma-generational:            0.4342 MiB/s,      6250.6510 iters/s 
+* Nautilus-generational:    154,000 iters/s
 
 Misc
 
