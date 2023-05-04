@@ -3,19 +3,19 @@ Simplest possible benchmark, measured against empty case, snapshot taken at star
 ![[Pasted image 20230202152804.png]]
 
 ## Single-threaded:
-zfuzz: 3.2 million fcps
-afl-unicorn: 2,400 fcps
-libfuzzer: 350,000 fcps
+zfuzz: 3.2 million fcps  
+afl-unicorn: 2,400 fcps  
+libfuzzer: 350,000 fcps  
 
 ## 8-threads:
-zfuzz: 19 million fcps
-afl-unicorn: 7,600 fcps
-libfuzzer: 2.4 million fcps
+zfuzz: 19 million fcps  
+afl-unicorn: 7,600 fcps  
+libfuzzer: 2.4 million fcps  
 
 ## 16-threads:
-zfuzz: 22million fcps
-afl-unicorn: -
-libfuzzer: 2.4 million fcps
+zfuzz: 22million fcps  
+afl-unicorn: -  
+libfuzzer: 2.4 million fcps  
 
 ## Conclusion
 Since this setup had the target executing basically no code, so pretty much the entire bottleneck existed in mutations for zfuzz. Disabling these and the resets brought the single-threaded performance up to 15 million fcps. Until threads started going onto hardware-threads rather than cores, zfuzz was scaling pretty much linearly. Afl-unicorn's performance in comparison dropped down immensely. The below screenshot showcases cpu usage for 8 fuzz-threads. With this, almost the entire cpu time was spent in the kernel at that point instead of fuzzing. Libfuzzer actually scaled surprisingly well. 90% of fuzz-time was still spent in the kernel, but this lined up about equally with its single threaded performance.
