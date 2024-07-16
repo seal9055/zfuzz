@@ -77,3 +77,6 @@ grammar as the generator.
 Custom mutators can very easily be added by just replacing the `src/mutator.rs` file. Your custom
 mutator only needs to support a .mutate() method and you should be good to go. In the past I've used
 this to eg. pass in an AST and do AST-based mutations for targets that would benefit from this.
+
+View `/design.md` and `/notes` for more information on design choices and qemu/unicorn notes I took
+while starting this project.
