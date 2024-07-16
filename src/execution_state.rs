@@ -91,11 +91,14 @@ pub struct ExecEnv {
     pub fuzz_input: Vec<u8>,
 
     /// Holds the current program break at which new memory is allocated whenever needed
-    alloc_addr: u64,
+    pub alloc_addr: u64,
 
     /// Allocations made during process run, used to find heap bugs
     /// (address, size)
     pub heap_allocations: FxHashMap<u64, usize>,
+
+    /// List to keep track of free'd addresses to find double free's
+    pub freed: FxHashMap<u64, u32>,
 
     /// Allocations made during process run using mmap, require different allocation routine
     /// since the default allocator does not take an address while mmap does
@@ -126,11 +129,39 @@ impl ExecEnv {
             fuzz_input:        Vec::new(),
             alloc_addr:        FIRSTALLOCATION,
             heap_allocations:  FxHashMap::default(),
+            freed:             FxHashMap::default(),
             mmap_allocations:  FxHashMap::default(),
             dirty:             Vec::with_capacity(size / 4096 + 1),
             error_flag:        uc_error::OK,
             prev_block:        0x8392674281237520, // (arbitrary high-entropy number)
             cov_count:         0x0,
+        }
+    }
+
+    pub fn error_exit(&mut self, uc: &mut Unicorn<'_, ()>, error: uc_error) {
+        self.error_flag = error;
+        uc.emu_stop().unwrap();
+    }
+
+    /// Mark pages from `address` to `address + size` as dirty
+    /// This should be used when harnesses or syscalls write to memory since those won't be covered
+    /// by our memory-write hooks in the emulator
+    pub fn mark_dirtied(&mut self, address: u64, size: usize) {
+        let alloc_end = address + size as u64;
+        let mut cur = address;
+        let mut size_left = size;
+
+        while cur <= alloc_end {
+            self.dirty.push(cur as usize);
+            if size_left >= 4096 {
+                cur += 4096;
+                size_left -= 4096;
+            } else if size_left == 0 {
+                break;
+            } else {
+                cur += size_left as u64;
+                size_left = 0;
+            }
         }
     }
 
@@ -145,37 +176,55 @@ impl ExecEnv {
         // Cannot allocate without running out of memory
         if base >= MAX_ALLOCATION_ADDR || 
                 base.checked_add(aligned_size as u64).unwrap() >= MAX_ALLOCATION_ADDR {
+            // Set pc to the address that called free so the the fuzzer/user has more useful 
+            // information about the source of the issue
+            uc.set_crash_pc(uc.func_return_addr().unwrap());
             return Err(uc_error::NOMEM);
         }
 
         // Register this allocation so it can later be free'd
-        self.heap_allocations.insert(base, aligned_size);
+        self.heap_allocations.insert(base, size);
 
         // Set permissions on allocated memory region and increase the next allocation addr
-        uc.mem_protect(base, aligned_size, perms)?;
+        uc.mem_protect(base, size, perms)?;
         self.alloc_addr = self.alloc_addr.checked_add(aligned_size as u64).unwrap();
 
         Ok(base)
     }
 
     /// Free a region of previously allocated memory
-    pub fn free(&mut self, uc: &mut Unicorn<'_, ()>, addr: u64) 
-            -> Result<(), uc_error> {
-
+    pub fn free(&mut self, uc: &mut Unicorn<'_, ()>, addr: u64) -> Result<(), uc_error> {
         if addr > MAX_ALLOCATION_ADDR {
-            return Err(uc_error::InvalidFree);
+            // Set pc to the address that called free so the the fuzzer/user has more useful 
+            // information about the source of the issue
+            uc.set_crash_pc(uc.func_return_addr().unwrap());
+            return Err(uc_error::OOB_FREE);
         }
+
+        // Free(0) just returns in libc-free implementations
+        if addr == 0 {
+            return Ok(());
+        }
+
+        if self.freed.get(&addr).is_some() {
+            // Set pc to the address that called free so the the fuzzer/user has more useful 
+            // information about the source of the issue
+            uc.set_crash_pc(uc.func_return_addr().unwrap());
+            return Err(uc_error::DOUBLE_FREE);
+        }
+
+        self.freed.insert(addr, 0);
 
         // Get the allocation size and perform the free
         if let Some(allocation_size) = self.heap_allocations.get(&addr) {
             let aligned_size = (0xfff + allocation_size) & !0xfff;
 
-            // Free memory by resetting permissions to `NONE`. 
+            // Free memory by resetting permissions to `NONE`.
             // We dont actually free the memory since that would be much more expensive
             uc.mem_protect(addr, aligned_size, Permission::NONE)?;
             Ok(())
         } else {
-            panic!("Attempting to free memory that hasn't been allocted @ 0x{addr:X}");
+            return Ok(())
         }
     }
 
@@ -240,6 +289,26 @@ impl ExecEnv {
         }
         self.dirty.clear();
 
+        if false {
+            let mut reader = [0; 4096];
+            for (addr, page) in snapshot_context.page_map.iter() {
+                unicorn.mem_read(*addr as u64, &mut reader).unwrap();
+                //let orig = snapshot_context.page_map.get(&addr).unwrap();
+
+                assert_eq!(reader.len(), 4096);
+                assert_eq!(page.len(), 4096);
+
+                // Sanity check for dirty bit snapshot resets
+                for i in 0..reader.len() {
+                    if reader[i] != page[i] {
+                        panic!("ERROR {:#X?}:{} - {}, {}", addr, i, reader[i], page[i]);
+                    } else {
+                        //println!("All Good");
+                    }
+                }
+            }
+        }
+
         // Free all Heap allocations made in the fuzz-case by resetting permissions of memory
         // regions to `NONE`. We dont actually free the memory since that would be much more 
         // expensive
@@ -247,6 +316,7 @@ impl ExecEnv {
             unicorn.mem_protect(*alloc_addr, *size, Permission::NONE)?;
         }
         self.heap_allocations.clear();
+        self.freed.clear();
 
         // For mmap'd regions, actually remove them cause they pollute the address space
         for (alloc_addr, size) in &self.mmap_allocations {

@@ -17,6 +17,9 @@ pub static DICT_FILE: OnceLock<Option<String>> = OnceLock::new();
 /// Path to directory to which fuzzer-outputs are saved
 pub static OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 
+/// Path to directory from which fuzzer inputs are taken
+pub static INPUT_DIR: OnceLock<String> = OnceLock::new();
+
 /// Additional information is printed out, alongside rolling statistics. Some parts of this only
 /// work while running single-threaded
 pub static DEBUG_PRINT: OnceLock<bool> = OnceLock::new();
@@ -67,6 +70,7 @@ pub fn handle_cli(args: &mut Cli) {
         error_exit("You need to specify a valid output directory");
     }
     OUTPUT_DIR.set(args.output_dir.clone()).unwrap();
+    INPUT_DIR.set(args.input_dir.clone()).unwrap();
 
     if let Some(dict) = &args.dictionary {
         if !std::path::Path::new(&dict).is_file() {
@@ -84,8 +88,16 @@ pub fn handle_cli(args: &mut Cli) {
 
         let mut inv_insns_dir = args.output_dir.clone();
         inv_insns_dir.push_str(&format!("/{}/inv_insns/", target.target_id));
+        
+        let mut corpus_dir = args.output_dir.clone();
+        corpus_dir.push_str(&format!("/{}/corpus/", target.target_id));
+
+        let mut timeout_dir = args.output_dir.clone();
+        timeout_dir.push_str(&format!("/{}/timeouts/", target.target_id));
 
         std::fs::create_dir_all(crash_dir).unwrap();
         std::fs::create_dir_all(inv_insns_dir).unwrap();
+        std::fs::create_dir_all(corpus_dir).unwrap();
+        std::fs::create_dir_all(timeout_dir).unwrap();
     }
 }

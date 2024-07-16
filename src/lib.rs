@@ -2,7 +2,6 @@
 //!
 //! Follow up on SFUZZ built on top of the unicorn emulation engine
 
-#![feature(once_cell)]
 #![feature(variant_count)]
 
 pub mod syscalls;
@@ -41,16 +40,19 @@ use parking_lot::RwLock;
 use fasthash::{xx::Hash32, FastHash};
 use unicorn_engine::{
     Unicorn, RegisterX86,
-    unicorn_const::{Permission, uc_error, Arch},
+    unicorn_const::{Permission, uc_error, Arch, Mode},
 };
 
-use std::sync::atomic::AtomicUsize;
-use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
-use std::cell::RefCell;
-use std::sync::Arc;
-use std::rc::Rc;
-use std::process;
+use std::{
+    sync::atomic::AtomicUsize,
+    collections::BTreeMap,
+    sync::mpsc::Sender,
+    cell::RefCell,
+    sync::Arc,
+    rc::Rc,
+    process,
+    path::Path,
+};
 
 /// Small wrapper to easily handle unrecoverable errors without panicking
 pub fn error_exit(msg: &str) -> ! {
@@ -108,6 +110,7 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
     let mut local_unique_crashes      = 0;
     let mut local_coverage_count      = 0;
     let mut local_invalid_insns_count = 0;
+    let mut local_total_timeouts      = 0;
 
     // Current index into the input array of the corpus
     let mut input_index = 0;
@@ -156,10 +159,14 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
                 case_res = Err(exec_env.borrow().error_flag);
             }
 
+            if unicorn.check_timeout() && exec_env.borrow().error_flag == uc_error::OK {
+                case_res = Err(uc_error::TIMEOUT);
+            }
+
             // If a crash occured, check if it is a unique crash (different pc from previous 
             // crashes), and if so, save the crashing input to disk
             if let Err(err) = case_res {
-                let pc = unicorn.get_pc().unwrap() as usize;
+                let mut pc = unicorn.get_pc().unwrap() as usize;
                 match err {
                     uc_error::INSN_INVALID => {
                         // Unicorn does not have great support for simd instruction sets
@@ -189,11 +196,21 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
                     uc_error::WRITE_PROT      |
                     uc_error::WRITE_UNALIGNED |
                     uc_error::WRITE_UNMAPPED  |
+                    uc_error::DOUBLE_FREE     |
+                    uc_error::OOB_FREE        |
                     uc_error::FETCH_PROT      |
                     uc_error::FETCH_UNALIGNED |
                     uc_error::FETCH_UNMAPPED  => {
                         let mut crash_map = target_shared.crash_mapping.write();
                         local_total_crashes += 1;
+
+                        // For some reason the pc from these crashes isn't properly propagated so
+                        // a separate pc variable is set for them
+                        if err == uc_error::NOMEM ||
+                           err == uc_error::DOUBLE_FREE ||
+                           err == uc_error::OOB_FREE {
+                               pc = unicorn.crash_pc() as usize;
+                        }
 
                         // This checks if this is is a unique crash or one we have seen before
                         if crash_map.get(&pc).is_some() {
@@ -225,11 +242,35 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
                             Err(uc_error::NOMEM) => {
                                 format!("{output_dir}/{target_dir}/crashes/oom_{h:x}_{pc:x}")
                             },
+                            Err(uc_error::DOUBLE_FREE) => {
+                                format!("{output_dir}/{target_dir}/crashes/double_free_{h:x}_{pc:x}")
+                            },
+                            Err(uc_error::OOB_FREE) => {
+                                format!("{output_dir}/{target_dir}/crashes/oob_free_{h:x}_{pc:x}")
+                            },
                             _ => unreachable!(),
                         };
                         std::fs::write(&crash_file, &exec_env.borrow().fuzz_input).unwrap();
                     },
-                    _ => panic!("Emulator quit with unhandled error: {case_res:?} @ {pc:0x?}"),
+                    uc_error::TIMEOUT => {
+                        let mut timeout_map = target_shared.timeout_mapping.write();
+                        local_total_timeouts += 1;
+
+                        // This checks if this is is a unique timeout or one we have seen before
+                        // This wont work well
+                        if timeout_map.get(&pc).is_some() {
+                            continue;
+                        }
+                        timeout_map.insert(pc, 0);
+
+                        let output_dir = OUTPUT_DIR.get().unwrap();
+                        let h = Hash32::hash(&exec_env.borrow().fuzz_input);
+                        let target_dir = harness_init.target_id;
+
+                        let f = format!("{output_dir}/{target_dir}/timeouts/{h:x}_{pc:x}");
+                        std::fs::write(&f, &exec_env.borrow().fuzz_input).unwrap();
+                    },
+                    _ => panic!("Emulator quit with unhandled error: {case_res:?} @ {pc:#0x?}"),
                 }
             }
 
@@ -244,6 +285,12 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
                 local_coverage_count += case_cov;
                 let mut corp_inputs = all_shared.inputs.write();
 
+                let output_dir = OUTPUT_DIR.get().unwrap();
+                let h = Hash32::hash(&exec_env.borrow().fuzz_input);
+                let target_dir = harness_init.target_id;
+                let out_file = format!("{output_dir}/{target_dir}/corpus/{h:x}");
+                std::fs::write(&out_file, &exec_env.borrow().fuzz_input).unwrap();
+
                 // Add this input to the corpus. Since the emulator no longer needs it (its being 
                 // reset after this fuzz-case anyways), we just drain it out of the emulators 
                 // fuzz_input instead of cloning a new data-array
@@ -256,6 +303,7 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
             target_id:     harness_init.target_id,
             total_cases:   SEED_ENERGY,
             crashes:       local_total_crashes,
+            timeouts:      local_total_timeouts,
             ucrashes:      local_unique_crashes,
             coverage:      local_coverage_count,
             invalid_insns: local_invalid_insns_count,
@@ -267,6 +315,7 @@ pub fn worker(harness_init: &HarnessInit, snapshot: Arc<SnapshotContext>,
 
         // Reset local statistics
         local_total_crashes       = 0;
+        local_total_timeouts      = 0;
         local_unique_crashes      = 0;
         local_coverage_count      = 0;
         local_invalid_insns_count = 0;
@@ -284,6 +333,9 @@ pub struct Statistics {
 
     /// Total crashes
     pub crashes: usize,
+
+    /// Total crashes
+    pub timeouts: usize,
 
     /// Unique crashes (A crash at a pc that has not had a crash before)
     pub ucrashes: usize,
@@ -307,6 +359,7 @@ impl Statistics {
             target_id: id,
             total_cases: 0,
             crashes: 0,
+            timeouts: 0,
             ucrashes: 0,
             coverage: 0,
             invalid_insns: 0,
@@ -360,6 +413,9 @@ pub struct TargetShared {
     /// Used to dedup crashes and only save off unique crashes
     pub crash_mapping: RwLock<FxHashMap<usize, u8>>,
 
+    /// Used to dedup crashes and only save off unique crashes
+    pub timeout_mapping: RwLock<FxHashMap<usize, u8>>,
+
     /// Fuzzer indexes this using a hash of the edge-coverage to check if it found new coverage
     pub coverage_bytemap: Vec<u8>,
 
@@ -378,6 +434,7 @@ impl TargetShared {
     pub fn new() -> Self {
         Self {
             crash_mapping:    RwLock::new(FxHashMap::default()),
+            timeout_mapping:  RwLock::new(FxHashMap::default()),
             coverage_bytemap: vec![0; COVMAP_SIZE as usize],
             cov_counter:      AtomicUsize::new(0),
         }
@@ -385,7 +442,7 @@ impl TargetShared {
 }
 
 /// Used to verify that the binary is suitable for this fuzzer. (64-bit, ELF, Little Endian...)
-fn verify_elf_hdr(elf_hdr: elfparser::Header) -> Result<(), String> {
+fn _verify_elf_hdr(elf_hdr: elfparser::Header) -> Result<(), String> {
     if elf_hdr.magic != ELFMAGIC {
         return Err("Magic value does not match ELF".to_string());
     }
@@ -405,9 +462,9 @@ pub fn load_elf_segments(unicorn: &mut Unicorn<'_, ()>, filename: &str) -> Resul
     let target = std::fs::read(filename).expect("Failed to read target binary from disk");
     let elf = elfparser::ELF::parse_elf(&target);
 
-    if let Err(error) = verify_elf_hdr(elf.header) {
-        error_exit(&format!("Process exited with error: {error}"));
-    }
+//    if let Err(error) = verify_elf_hdr(elf.header) {
+//        error_exit(&format!("Process exited with error: {error}"));
+//    }
 
     // Loop through all segments and allocate memory for each segment with segment-type=Load
     for phdr in elf.program_headers {
@@ -485,7 +542,7 @@ pub fn load_dump(exec_env: &Rc<RefCell<ExecEnv>>, unicorn: &mut Unicorn<'_, ()>,
     let raw_memory_path: String = dump_dir.to_string() + "/raw_memory/";
 
     // Load files from dump and initialize exec_env with the parsed file-data
-    {
+    if Path::new(&files_path).exists() {
         let files_slice = std::fs::read(files_path).expect("Failed to read fd-dump");
         let open_files: Vec<FileRepr> =serde_json::from_slice(&files_slice).unwrap();
 
@@ -535,7 +592,6 @@ pub fn load_dump(exec_env: &Rc<RefCell<ExecEnv>>, unicorn: &mut Unicorn<'_, ()>,
     }
 
     // Load memory from dump and initialize unicorn's memory mappings with the parsed memory-data
-    // TODO: Check what the `offset` field is used for in gdb-memory-maps
     {
         let mem_slice = std::fs::read(memory_path).expect("Failed to read memory-mappings");
         let vmmap: Vec<MemMapRepr> = serde_json::from_slice(&mem_slice).unwrap();
@@ -580,12 +636,19 @@ pub fn load_dump(exec_env: &Rc<RefCell<ExecEnv>>, unicorn: &mut Unicorn<'_, ()>,
         let reg_mapping: RegRepr = serde_json::from_slice(&reg_slice).unwrap();
 
         match unicorn.get_arch() {
-            Arch::X86 => resolve_x86_regs(unicorn, &reg_mapping)?,
+            Arch::X86 => {
+                match unicorn.get_mode() {
+                    Mode::MODE_32 => resolve_x86_32_regs(unicorn, &reg_mapping)?,
+                    Mode::MODE_64 => resolve_x86_regs(unicorn, &reg_mapping)?,
+                    _ => unreachable!(),
+                }
+            }
             _ => panic!("Dump loader does not support your target arch\n\
             (Note: This is very easy to manually add, just requires you to define a \
             register-mapping dictionary"),
         }
     }
+    println!("HI");
 
     Ok(())
 }
@@ -619,6 +682,33 @@ pub fn resolve_x86_regs(unicorn: &mut Unicorn<'_, ()>, reg_mappings: &RegRepr)
     unicorn.reg_write(RegisterX86::GS, *reg_mappings.0.get("gs").unwrap() as u64)?;
     unicorn.reg_write(RegisterX86::FS_BASE, *reg_mappings.0.get("fs_base").unwrap() as u64)?;
     unicorn.reg_write(RegisterX86::GS_BASE, *reg_mappings.0.get("gs_base").unwrap() as u64)?;
+    Ok(())
+}
+
+/// Parse string representation of registers to unicorn `RegisterX86` enums
+pub fn resolve_x86_32_regs(unicorn: &mut Unicorn<'_, ()>, reg_mappings: &RegRepr) 
+        -> Result<(), uc_error> {
+            println!("X");
+    unicorn.reg_write(RegisterX86::EAX, *reg_mappings.0.get("eax").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EBX, *reg_mappings.0.get("ebx").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::ECX, *reg_mappings.0.get("ecx").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EDX, *reg_mappings.0.get("edx").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::ESI, *reg_mappings.0.get("esi").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EDI, *reg_mappings.0.get("edi").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EBP, *reg_mappings.0.get("ebp").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::ESP, *reg_mappings.0.get("esp").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EIP, *reg_mappings.0.get("eip").unwrap() as u64)?;
+    unicorn.reg_write(RegisterX86::EFLAGS, *reg_mappings.0.get("eflags").unwrap() as u64)?;
+
+    // For some reason unicorn is not happy with us doing this and crashes on `reg_write`
+    //unicorn.reg_write(RegisterX86::CS, *reg_mappings.0.get("cs").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::SS, *reg_mappings.0.get("ss").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::DS, *reg_mappings.0.get("ds").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::ES, *reg_mappings.0.get("es").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::FS, *reg_mappings.0.get("fs").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::GS, *reg_mappings.0.get("gs").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::FS_BASE, *reg_mappings.0.get("fs_base").unwrap() as u64)?;
+    //unicorn.reg_write(RegisterX86::GS_BASE, *reg_mappings.0.get("gs_base").unwrap() as u64)?;
     Ok(())
 }
 

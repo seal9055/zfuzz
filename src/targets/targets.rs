@@ -18,8 +18,8 @@ const NUM_TARGETS: usize = 1;
 /// Register one or more harnesses that are used to initialize the fuzzer(s)
 pub const TARGETS: [HarnessInit; NUM_TARGETS] = [
     HarnessInit {
-        target_id: TargetId::TargetTwo as usize,
-        num_threads: 16,
+        target_id: TargetId::TargetOne as usize,
+        num_threads: 1,
         instr_timeout: 0,
         time_timeout: 0,
     },

@@ -72,7 +72,7 @@ pub fn exit_group(exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> R
     exit(exec_env, unicorn)
 }
 
-pub fn fstat(exec_env: Ref<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
+pub fn fstat(mut exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
     dbg_print("SYSCALL fstat");
     let fd      = unicorn.reg_read(unicorn.syscall_arg0_reg()?)? as usize;
     let statbuf = unicorn.reg_read(unicorn.syscall_arg1_reg()?)?;
@@ -117,6 +117,7 @@ pub fn fstat(exec_env: Ref<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<()
         };
 
         // Write in the stat data
+        exec_env.mark_dirtied(statbuf, stat.len());
         unicorn.mem_write(statbuf, stat)?;
         unicorn.reg_write(unicorn.syscall_return_reg()?, 0)?;
     } else if file.unwrap().ftype != FileType::OTHER {
@@ -188,6 +189,7 @@ pub fn read(mut exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Res
         let offset = exec_env.fd_list[fd].cursor.unwrap();
         let len = core::cmp::min(count, exec_env.fuzz_input.len()-offset);
 
+        exec_env.mark_dirtied(buf, len);
         unicorn.mem_write(buf, &exec_env.fuzz_input[offset..offset+len])
             .expect("Error occured while trying to read in fuzz-input");
 
@@ -300,7 +302,7 @@ pub fn access(unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
     Ok(())
 }
 
-pub fn fstatat(exec_env: Ref<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
+pub fn fstatat(mut exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
     dbg_print("SYSCALL fstatat");
     let _dirfd   = unicorn.reg_read(unicorn.syscall_arg0_reg()?)?;
     let pathname = unicorn.reg_read(unicorn.syscall_arg1_reg()?)?;
@@ -345,6 +347,7 @@ pub fn fstatat(exec_env: Ref<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<
         };
 
         // Write in the stat data
+        exec_env.mark_dirtied(statbuf, stat.len());
         unicorn.mem_write(statbuf, stat)?;
         unicorn.reg_write(unicorn.syscall_return_reg()?, 0)?;
     } else {
@@ -415,15 +418,35 @@ pub fn mmap(mut exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Res
     Ok(())
 }
 
-pub fn getrandom(unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
+pub fn getrandom(mut exec_env: RefMut<ExecEnv>, unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
     dbg_print("SYSCALL getrandom");
     let buf     = unicorn.reg_read(unicorn.syscall_arg0_reg()?)?;
     let buflen  = unicorn.reg_read(unicorn.syscall_arg1_reg()?)? as usize;
-    let _flags   = unicorn.reg_read(unicorn.syscall_arg2_reg()?)?;
+    let _flags  = unicorn.reg_read(unicorn.syscall_arg2_reg()?)?;
 
     let random_bytes: Vec<u8> = (0..buflen).map(|_| { rand::random::<u8>() }).collect();
+    exec_env.mark_dirtied(buf, random_bytes.len());
     unicorn.mem_write(buf, &random_bytes)?;
 
     unicorn.reg_write(unicorn.syscall_return_reg()?, random_bytes.len() as u64)?;
     Ok(())
 }
+
+pub fn times(unicorn: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
+    dbg_print("SYSCALL times");
+    let buf = unicorn.reg_read(unicorn.syscall_arg0_reg()?)?;
+
+    if buf == 0 {
+        unicorn.reg_write(unicorn.syscall_return_reg()?, 0xffffffff)?;
+        return Ok(());
+    }
+
+    let random_bytes = [0x0; 16];
+    unicorn.mem_write(buf, &random_bytes)?;
+
+    // Number of clock ticks, random number taken from my system time
+    unicorn.reg_write(unicorn.syscall_return_reg()?, 1961122165u64)?;
+    Ok(())
+}
+
+

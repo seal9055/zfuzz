@@ -18,6 +18,12 @@ use std::cell::RefCell;
 
 const DUMP_PATH: &str = "./dump";
 
+/// If these addresses are hit, stop fuzz-run
+const EXIT_ADDRS: [u64; 2] = [
+    0x401670,
+    0x40169c,
+];
+
 pub fn initialize_target() 
         -> Result<(Rc<RefCell<ExecEnv>>, Unicorn<'static, ()>), uc_error> {
     // Create emulator that will hold system context such as open files, dirty pages, etc
@@ -49,8 +55,9 @@ pub fn initialize_target()
         insert_input_hook(&exec_env, &mut unicorn, hook_location)?;
 
         // Hooks to early exit after fuzz-case explored interesting target-state
-        insert_exit_hook(&mut unicorn, 0x401670)?;
-        insert_exit_hook(&mut unicorn, 0x40169c)?;
+        EXIT_ADDRS.iter().for_each(|e| {
+            insert_exit_hook(&mut unicorn, *e).unwrap(); 
+        });
     }
 
     // Return initialized execution-environment/emulator to caller
@@ -69,6 +76,9 @@ pub fn insert_input_hook(exec_env: &Rc<RefCell<ExecEnv>>, unicorn: &mut Unicorn<
         mutated_data.truncate(100);
         
         uc.reg_write(RegisterX86::RAX, mutated_data.len() as u64).unwrap();
+
+        // Mark the memory region as dirtied so our snapshot resets properly reset this memory area
+        exec_env_clone.borrow_mut().mark_dirtied(input_buffer_addr, mutated_data.len());
         uc.mem_write(input_buffer_addr, &mutated_data)
             .expect("Failed to write mutated data into target");
     };

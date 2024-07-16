@@ -104,6 +104,7 @@ fn main() -> Result<(), uc_error> {
         stats.get_mut(&id).unwrap().crashes       += received.crashes;
         stats.get_mut(&id).unwrap().ucrashes      += received.ucrashes;
         stats.get_mut(&id).unwrap().coverage      += received.coverage;
+        stats.get_mut(&id).unwrap().timeouts      += received.timeouts;
         stats.get_mut(&id).unwrap().invalid_insns += received.invalid_insns;
         stats.get_mut(&id).unwrap().num_inputs     = received.num_inputs;
 

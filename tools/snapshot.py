@@ -107,7 +107,6 @@ class FullDump(gdb.Command):
             pid = int(tmp)
 
         # Verify that the process is correctly running
-        #pid = gdb.selected_inferior().pid
         if not pid or not gdb.selected_inferior().is_valid():
             print("[!]: Couldn't get pid. Make sure the process is running before generating trace")
             return False
@@ -116,7 +115,6 @@ class FullDump(gdb.Command):
         open_fds = in_use_fds(pid)
         if not open_fds:
             print("[!]: Couldn't get file listings for process")
-            return False
 
         # Retrieve and parse memory mappings
         vmmap = process_mappings()
@@ -152,8 +150,22 @@ class FullDump(gdb.Command):
 
         # Get register-names and their values
         arch = gdb.selected_frame().architecture()
+
         reg_groups = arch.register_groups()
         reg_map = {}
+        mode = 0
+        # Determine 64 vs 32-bot
+        # TODO other archs
+        for reg in arch.registers():
+            if str(reg) == "eax":
+                mode = 32
+            elif str(reg) == "rax":
+                mode = 64
+
+        if mode == 0:
+            print("Specify 32/64-bit")
+            return False
+
         for reg_group in reg_groups:
             # TODO
             # Some of the other more complicated memory groups (eg. regs to handle floats) are
@@ -164,34 +176,41 @@ class FullDump(gdb.Command):
 
             regs = arch.registers(str(reg_group))
             for reg in regs:
-                value = int(gdb.parse_and_eval(f'${reg}'))
-                u64 = value % 2**64
-                reg_map[str(reg)] = u64
+                if mode == 32:
+                    value = int(gdb.parse_and_eval(f'${reg}'))
+                    u32 = value % 2**32
+                    reg_map[str(reg)] = u32
+                elif mode == 64:
+                    value = int(gdb.parse_and_eval(f'${reg}'))
+                    u64 = value % 2**64
+                    reg_map[str(reg)] = u64
 
         # Prepare disk for dumping
         if os.path.exists(dump_path):
             shutil.rmtree(dump_path)
         os.makedirs(dump_path)
         os.makedirs(dump_path + "raw_memory/")
-        os.makedirs(dump_path + "raw_files/")
 
         # Dump register maps
         with open(dump_path + "regs", "w+") as f:
             json.dump(reg_map, f, indent = 4)
 
-        # Dump open file information
-        with open(dump_path + "files", "w+") as f:
-            json.dump(open_fds, f, indent = 4)
-
         # Dump data-backing for files if we can read it
-        for file in open_fds:
-            with open(file["name"][:-3], "rb") as file_backing:
-                # Check if the file has any data to read
-                r, _, _ = select.select([ file_backing ], [], [], 0)
-                if file_backing in r:
-                    backing = file_backing.read()
-                    with open(dump_path + f"raw_files/raw_{file['fd']}", "wb+") as tmp:
-                        tmp.write(backing)
+        if open_fds:
+            os.makedirs(dump_path + "raw_files/")
+
+            # Dump open file information
+            with open(dump_path + "files", "w+") as f:
+                    json.dump(open_fds, f, indent = 4)
+
+            for file in open_fds:
+                with open(file["name"][:-3], "rb") as file_backing:
+                    # Check if the file has any data to read
+                    r, _, _ = select.select([ file_backing ], [], [], 0)
+                    if file_backing in r:
+                        backing = file_backing.read()
+                        with open(dump_path + f"raw_files/raw_{file['fd']}", "wb+") as tmp:
+                            tmp.write(backing)
 
         # Dump memory mappings and the raw-data
         for i in range(0, len(memory)):

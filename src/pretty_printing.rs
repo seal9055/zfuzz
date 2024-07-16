@@ -1,5 +1,5 @@
 use crate::{
-    arg_setup::DEBUG_PRINT,
+    arg_setup::{DEBUG_PRINT, OUTPUT_DIR, INPUT_DIR},
     Statistics,
     targets::targets::TARGETS,
 };
@@ -105,6 +105,8 @@ pub fn print_stats(term: &Term, stats: &FxHashMap<usize, Statistics>, elapsed_ti
                                  cur_stats.ucrashes.to_formatted_string(&Locale::en))).unwrap();
         term.write_line(&format!("   Crashes: {}", 
                                  cur_stats.crashes.to_formatted_string(&Locale::en))).unwrap();
+        term.write_line(&format!("   Timeouts: {}", 
+                                 cur_stats.timeouts.to_formatted_string(&Locale::en))).unwrap();
 
         term.move_cursor_up(2).unwrap();
         term.move_cursor_right(30).unwrap();
@@ -148,6 +150,10 @@ pub fn print_stats(term: &Term, stats: &FxHashMap<usize, Statistics>, elapsed_ti
 
         term.move_cursor_down(1).unwrap();
         term.write_line(&format!("\t\t+----Static Settings ----+")).unwrap();
+        term.write_line(&format!("   Input Dir: {}", INPUT_DIR.get().unwrap())).unwrap();
+        term.move_cursor_right(27).unwrap();
+        term.move_cursor_up(1).unwrap();
+        term.write_line(&format!("   Output Dir: {}", OUTPUT_DIR.get().unwrap())).unwrap();
         term.write_line(&format!("   Num Threads: {}", 
                                  TARGETS[cur_target_index].num_threads)).unwrap();
         term.move_cursor_right(27).unwrap();

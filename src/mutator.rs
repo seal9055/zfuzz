@@ -92,19 +92,20 @@ impl Mutator {
     /// Chose a set of random bytes and mutate them. Prefer small corruption over larger one's
     fn byte_replace(&mut self, input: &mut [u8]) -> Result<(),()> {
         let input_length = input.len();
+        if input_length < 4 { return Err(()); }
         let (r1, r2) = self.get2_rand();
 
         if (r1 % 1000) < 950 {
             // Small corruption, 0-32 bytes
             for _ in 1..(r2 % 32) {
                 let (r1, r2) = self.get2_rand();
-                input[(r1 % input_length)] = r2 as u8;
+                input[r1 % input_length] = r2 as u8;
             }
         } else {
             // Larger corruption, 64-128 bytes
             for _ in 64..(64 + (r2 % 64)) {
                 let (r1, r2) = self.get2_rand();
-                input[(r1 % input_length)] = r2 as u8;
+                input[r1 % input_length] = r2 as u8;
             }
         }
         Ok(())
@@ -113,6 +114,7 @@ impl Mutator {
     /// Flip some random bits in the input
     fn bit_flip(&mut self, input: &mut [u8]) -> Result<(),()> {
         let input_length = input.len();
+        if input_length < 4 { return Err(()); }
         let (r1, r2) = self.get2_rand();
 
         if (r1 % 1000) < 950 {
@@ -120,14 +122,14 @@ impl Mutator {
             for _ in 1..(r2 % 32) {
                 let (r1, r2) = self.get2_rand();
                 let bit_idx = r1 % 8;
-                input[(r2 % input_length)] ^= 1 << bit_idx;
+                input[r2 % input_length] ^= 1 << bit_idx;
             }
         } else {
             // Larger corruption, flip 64-128 bits
             for _ in 64..(64 + (r2 % 64)) {
                 let (r1, r2) = self.get2_rand();
                 let bit_idx = r1 % 8;
-                input[(r2 % input_length)] ^= 1 << bit_idx;
+                input[r2 % input_length] ^= 1 << bit_idx;
             }
         }
         Ok(())
@@ -155,6 +157,7 @@ impl Mutator {
     /// Add or subtract some bytes to attempt to cause an integer over/underflow
     fn simple_arithmetic(&mut self, input: &mut [u8]) -> Result<(),()> {
         let input_length = input.len();
+        if input_length < 4 { return Err(()); }
 
         let (r1, r2) = self.get2_rand();
 
@@ -163,11 +166,11 @@ impl Mutator {
             for i in 1..(r2 % 32) {
                 let (r1, r2) = self.get2_rand();
                 if i & 1 == 0 {
-                    input[(r1 % input_length)] = 
-                        input[(r1 % input_length)].wrapping_add((r2 % 32) as u8);
+                    input[r1 % input_length] = 
+                        input[r1 % input_length].wrapping_add((r2 % 32) as u8);
                 } else {
-                    input[(r1 % input_length)] = 
-                        input[(r1 % input_length)].wrapping_sub((r2 % 32) as u8);
+                    input[r1 % input_length] = 
+                        input[r1 % input_length].wrapping_sub((r2 % 32) as u8);
                 }
             }
         } else {
@@ -175,11 +178,11 @@ impl Mutator {
             for i in 64..(64 + (r2 % 64)) {
                 let (r1, r2) = self.get2_rand();
                 if i & 1 == 0 {
-                    input[(r1 % input_length)] = 
-                        input[(r1 % input_length)].wrapping_add((r2 % 32) as u8);
+                    input[r1 % input_length] = 
+                        input[r1 % input_length].wrapping_add((r2 % 32) as u8);
                 } else {
-                    input[(r1 % input_length)] = 
-                        input[(r1 % input_length)].wrapping_sub((r2 % 32) as u8);
+                    input[r1 % input_length] = 
+                        input[r1 % input_length].wrapping_sub((r2 % 32) as u8);
                 }
             }
         }

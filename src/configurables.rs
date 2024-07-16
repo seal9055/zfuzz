@@ -19,12 +19,15 @@ pub const COVMAP_SIZE: u64 = 1024 * 1024 * 1024;
 /// Enables some debug prints
 pub const DEBUG: bool = false;
 
+/// Emit coverage data
+pub const EMIT_COV: bool = false;
+
 /// The starting address for our memory allocator (Change if this overlaps with an address the 
 /// target uses
 pub const FIRSTALLOCATION: u64 = 0x900000;
 
 /// Amount of memory allocated for each emulator to handle stack & heap allocations
-pub const VMMAP_ALLOCATION_SIZE: usize = 16 * 1024 * 1024;
+pub const VMMAP_ALLOCATION_SIZE: usize = 32 * 1024 * 1024;
 
 /// Maximum address that can be used by the emulator for allocations before going OOM
 pub const MAX_ALLOCATION_ADDR: u64 = FIRSTALLOCATION + VMMAP_ALLOCATION_SIZE as u64;
@@ -37,3 +40,13 @@ pub enum MutType {
     Mut,
     Gen,
 }
+
+/// Used to hook allocators differnetly based on libc versions
+#[derive(Eq, PartialEq)]
+pub enum LibcOpt {
+    Generic,
+    LibUc,
+}
+
+/// Set the libc version that can be used to hook certain library functions a bit differently
+pub const LIBC_VERSION: LibcOpt = LibcOpt::Generic;
