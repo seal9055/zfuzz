@@ -5,7 +5,7 @@
 DEBUG=false
 
 # Skip cmake command, use when config has already been done
-QUICK_REBUILD=true
+QUICK_REBUILD=false
 
 # Build fzero-based grammar mutator with grammar defined by `GRAMMAR_FILE`
 GRAMMAR=false
